@@ -1,0 +1,8 @@
+{
+    "start_message": "Hello! Please choose your language: English or Russian.",
+    "choose_language": "Please choose your language: /en for English or /ru for Russian.",
+    "register_prompt": "Please enter your username and email (separated by a comma). Example: username, email",
+    "registration_success": "Registration successful! Your data:\nUsername: {username}\nEmail: {email}",
+    "language_not_chosen": "You didn't choose a language. Please choose your language first."
+  }
+  
