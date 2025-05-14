@@ -1,8 +1,12 @@
 {
-    "start_message": "Hello! Please choose your language: English or Russian.",
-    "choose_language": "Please choose your language: /en for English or /ru for Russian.",
-    "register_prompt": "Please enter your username and email (separated by a comma). Example: username, email",
-    "registration_success": "Registration successful! Your data:\nUsername: {username}\nEmail: {email}",
-    "language_not_chosen": "You didn't choose a language. Please choose your language first."
-  }
-  
+  "start_message":       "✨ *Welcome to CryptoSignals Bot!* ✨\n\nHere you will receive trading signals from the admin team.",
+  "ask_username":        "Please enter your username:",
+  "ask_email":           "Great! Now please enter your email:",
+  "registration_success":"✅ Registration successful!\nUsername: {username}\nEmail: {email}",
+  "signals_button":      "Signals",
+  "commands_button":     "Commands",
+  "signals_text":        "📈 Here are the latest crypto signals:\n– BTC/USD: BUY at 45,000\n– ETH/USD: SELL at 3,200",
+  "commands_list":       "/start — restart\nSignals — show signals\nCommands — list commands\n/help — help",
+  "reset_button":         "🔄 Reset",
+  "choose_language":      "Please, choose the language"
+}

@@ -1,105 +1,192 @@
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils import executor
-import mysql.connector
-import json
+import os, json, logging, asyncio, mysql.connector
 from dotenv import load_dotenv
-import os
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# Загружаем переменные из .env файла
-load_dotenv()
-
-# Токен бота и данные для подключения к базе данных из .env файла
+# ─── 1. Load .env ─────────────────────────────────────────────────────────
+load_dotenv(override=True)
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DB_HOST = os.getenv("DB_HOST")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+DB_CFG = {
+    "host":     os.getenv("DB_HOST"),
+    "port":     int(os.getenv("DB_PORT",   "3306")),
+    "user":     os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+}
+if not API_TOKEN:
+    logging.error("Missing TELEGRAM_TOKEN in .env")
+    exit(1)
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
-
-# Создание экземпляра бота и диспетчера
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
+dp  = Dispatcher(storage=MemoryStorage())
 
-# Подключение к базе данных MySQL
-def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
+# ─── 2. FSM states ─────────────────────────────────────────────────────────
+class Form(StatesGroup):
+    lang     = State()
+    username = State()
+    email    = State()
+
+# ─── 3. DB helper ──────────────────────────────────────────────────────────
+def get_conn():
+    return mysql.connector.connect(**DB_CFG)
+
+# ─── 4. Load locale ─────────────────────────────────────────────────────────
+def load_messages(lang: str) -> dict:
+    return json.load(open(f"locales/{lang}.json", encoding="utf-8"))
+
+# ─── 5. Keyboards ───────────────────────────────────────────────────────────
+def language_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="English", callback_data="lang:en"),
+            InlineKeyboardButton(text="Русский", callback_data="lang:ru"),
+        ]]
     )
 
-# Функция для загрузки сообщений в зависимости от выбранного языка
-def load_messages(language="en"):
-    with open(f'locales/{language}.json', 'r', encoding='utf-8') as file:
-        return json.load(file)
+def reset_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔄 Reset", callback_data="action:reset")]]
+    )
 
-# Словарь для хранения текущего языка пользователя
-user_languages = {}
+def main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
+    msgs = load_messages(lang)
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=msgs["signals_button"]),
+                KeyboardButton(text=msgs["commands_button"])
+            ]
+        ],
+        resize_keyboard=True
+    )
 
-# Начало работы с ботом
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    # Проверяем, выбрал ли пользователь язык
-    user_id = message.from_user.id
-    if user_id not in user_languages:
-        await message.reply("Please choose your language: /en for English or /ru for Russian.")
-        return
+# ─── 6. Handlers ────────────────────────────────────────────────────────────
 
-    language = user_languages[user_id]
-    messages = load_messages(language)
-    await message.reply(messages['start_message'])
+@dp.message(Command("start"))
+async def cmd_start(msg: types.Message, state: FSMContext):
+    await state.clear()
+    # просто двуязычный призыв
+    await msg.answer(
+        "Please choose your language / Пожалуйста, выберите язык",
+        reply_markup=language_kb()
+    )
+    await state.set_state(Form.lang)
 
-# Обработчик выбора языка
-@dp.message_handler(commands=['en', 'ru'])
-async def choose_language(message: types.Message):
-    user_id = message.from_user.id
-    language = message.text[1:]  # Извлекаем язык из команды
-    if language not in ['en', 'ru']:
-        return
+async def _save_language(uid: int, lang: str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (user_id, language) VALUES (%s,%s) "
+        "ON DUPLICATE KEY UPDATE language=%s",
+        (uid, lang, lang)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    user_languages[user_id] = language
-    messages = load_messages(language)
-    await message.reply(messages['choose_language'])
+@dp.callback_query(Form.lang, F.data.startswith("lang:"))
+async def on_lang(cb: types.CallbackQuery, state: FSMContext):
+    lang = cb.data.split(":",1)[1]
+    uid  = cb.from_user.id
 
-# Регистрация пользователя
-@dp.message_handler()
-async def register(message: types.Message):
-    user_id = message.from_user.id
+    await _save_language(uid, lang)
+    await state.update_data(lang=lang)
 
-    if user_id not in user_languages:
-        await message.reply("You didn't choose a language. Please choose your language first.")
-        return
+    msgs = load_messages(lang)
+    # показываем стартовое сообщение из локали
+    await cb.message.edit_text(text=msgs["start_message"], reply_markup=reset_kb())
 
-    language = user_languages[user_id]
-    messages = load_messages(language)
+    # сразу спрашиваем никнейм
+    await cb.message.answer(text=msgs["ask_username"], reply_markup=reset_kb())
+    await state.set_state(Form.username)
+    await cb.answer()
 
-    # Если пользователь еще не выбрал язык, он будет перенаправлен к выбору
-    if ',' not in message.text:
-        await message.reply(messages['register_prompt'])
-        return
+@dp.message(Form.username, F.text)
+async def process_username(msg: types.Message, state: FSMContext):
+    await state.update_data(username=msg.text.strip())
+    data = await state.get_data()
+    msgs = load_messages(data["lang"])
 
-    user_input = message.text.split(',')
-    if len(user_input) == 2:
-        username = user_input[0].strip()
-        email = user_input[1].strip()
+    # теперь спрашиваем почту
+    await msg.answer(text=msgs["ask_email"], reply_markup=reset_kb())
+    await state.set_state(Form.email)
 
-        # Сохраняем данные в базу данных
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute("INSERT INTO users (username, email) VALUES (%s, %s)", (username, email))
-        connection.commit()
-        cursor.close()
-        connection.close()
+@dp.message(Form.email, F.text)
+async def process_email(msg: types.Message, state: FSMContext):
+    data     = await state.get_data()
+    uid      = msg.from_user.id
+    lang     = data["lang"]
+    username = data["username"]
+    email    = msg.text.strip()
 
-        await message.reply(messages['registration_success'].format(username=username, email=email))
-    else:
-        await message.reply(messages['register_prompt'])
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET username=%s, email=%s WHERE user_id=%s",
+        (username, email, uid)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    msgs = load_messages(lang)
+    # регистрация прошла — отправляем подтверждение + главное меню
+    await msg.answer(
+        text=msgs["registration_success"].format(username=username, email=email),
+        reply_markup=main_menu_kb(lang)
+    )
+    await state.clear()
+
+@dp.callback_query(F.data=="action:reset")
+async def on_reset(cb: types.CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    await state.clear()
+    await cb.message.edit_text(
+        text="Please choose your language / Пожалуйста, выберите язык",
+        reply_markup=language_kb()
+    )
+    await state.set_state(Form.lang)
+    await cb.answer()
+
+# ─── Main menu ───────────────────────────────────────────────────────────────
+
+@dp.message(F.text == load_messages("en")["signals_button"])
+@dp.message(F.text == load_messages("ru")["signals_button"])
+async def show_signals(msg: types.Message):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT language FROM users WHERE user_id=%s", (msg.from_user.id,))
+    lang = cur.fetchone()[0]
+    cur.close(); conn.close()
+
+    msgs = load_messages(lang)
+    await msg.answer(text=msgs["signals_text"])
+
+@dp.message(F.text == load_messages("en")["commands_button"])
+@dp.message(F.text == load_messages("ru")["commands_button"])
+async def show_commands(msg: types.Message):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT language FROM users WHERE user_id=%s", (msg.from_user.id,))
+    lang = cur.fetchone()[0]
+    cur.close(); conn.close()
+
+    msgs = load_messages(lang)
+    await msg.answer(text=msgs["commands_list"])
+
+# ─── Run ─────────────────────────────────────────────────────────────────────
+async def main():
+    await dp.start_polling(bot)
+
+if __name__=="__main__":
+    asyncio.run(main())
