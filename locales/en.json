@@ -8,5 +8,7 @@
   "signals_text":        "📈 Here are the latest crypto signals:\n– BTC/USD: BUY at 45,000\n– ETH/USD: SELL at 3,200",
   "commands_list":       "/start — restart\nSignals — show signals\nCommands — list commands\n/help — help",
   "reset_button":         "🔄 Reset",
-  "choose_language":      "Please, choose the language"
+  "choose_language":      "Please, choose the language",
+  "pay_prompt":           "Чтобы получить доступ к сигналам, оплатите подписку (30 дней):",
+  "invoice_message":      "Перейдите по ссылке для оплаты:\n{url}"
 }
