@@ -1,118 +1,156 @@
-# payments.py
-
 import os
-import hmac
-import hashlib
+import time
 import logging
-
 import httpx
 from aiohttp import web
 from aiogram import Bot
-
 from db import get_conn
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-# Настройка логирования
+# ─── Конфиг ────────────────────────────────────────────────────────────────────
+API_KEY        = os.getenv("NOWPAYMENTS_API_KEY")
+ADMIN_EMAIL    = os.getenv("NOWPAYMENTS_ADMIN_EMAIL")
+ADMIN_PASSWORD = os.getenv("NOWPAYMENTS_ADMIN_PASSWORD")
+IPN_SECRET     = os.getenv("NOWPAYMENTS_IPN_SECRET")
+IPN_ROUTE      = "/nowpayments/ipn"
+BOT_TOKEN      = os.getenv("TELEGRAM_TOKEN")
+BASE_URL       = "https://api.nowpayments.io/v1"
+PLAN_ID        = os.getenv("NOWPAYMENTS_PLAN_ID")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+bot = Bot(token=BOT_TOKEN)
 
-API_KEY      = os.getenv("NOWPAYMENTS_API_KEY")
-IPN_SECRET   = os.getenv("NOWPAYMENTS_IPN_SECRET")
-IPN_CALLBACK = os.getenv("NOWPAYMENTS_IPN_URL")   # должен включать путь /nowpayments/ipn
-BASE_URL     = "https://api.nowpayments.io/v1"
+# ─── JWT-кэш ──────────────────────────────────────────────────────────────────
+_jwt_cache = {"token": None, "expires": 0}
 
-# Инициализация бота для отправки уведомлений
-bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+async def _get_jwt() -> str:
+    now = time.time()
+    if _jwt_cache["token"] and now < _jwt_cache["expires"] - 30:
+        return _jwt_cache["token"]
 
-# ─── Создание счёта (invoice) в NOWPayments ───────────────────────────────────
-async def create_invoice(amount: float, currency: str = "USD", order_id: str = None) -> dict:
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{BASE_URL}/auth",
+            headers={
+                "x-api-key": API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "email":    ADMIN_EMAIL,
+                "password": ADMIN_PASSWORD
+            },
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        token = resp.json().get("token")
+        _jwt_cache["token"]   = token
+        _jwt_cache["expires"] = now + 5*60
+        logging.info("🔑 Acquired JWT")
+        return token
+
+async def create_email_subscription(email: str) -> dict:
     """
-    Создаёт счёт в NOWPayments и возвращает ответ API.
-    order_id обычно равен строковому Telegram user_id.
+    Создаёт подписку по email.
+    Возвращает dict с ключами, в том числе 'id'.
     """
+    jwt = await _get_jwt()
     payload = {
-        "price_amount":      amount,
-        "price_currency":    currency,
-        "order_id":          order_id,
-        "order_description": "Subscription",
-        "ipn_callback_url":  IPN_CALLBACK
+        "subscription_plan_id": PLAN_ID,
+        "email":                email,
+        # теперь callback настроен в плане, повторно не указываем
     }
     headers = {
-        "x-api-key":    API_KEY,
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {jwt}",
+        "x-api-key":     API_KEY,
+        "Content-Type":  "application/json"
     }
-
-    logging.info(f"Creating NOWPayments invoice for order_id={order_id}, amount={amount} {currency}")
     async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{BASE_URL}/invoice", json=payload, headers=headers)
+        resp = await client.post(
+            f"{BASE_URL}/subscriptions",
+            json=payload,
+            headers=headers,
+            timeout=15.0
+        )
         resp.raise_for_status()
-        invoice = resp.json()
-        logging.info(f"Invoice created: {invoice}")
-        return invoice
+        data = resp.json()
+        # API возвращает { "result":[ {...} ] }
+        if "result" in data:
+            return data["result"][0]
+        return data
 
-# ─── Обработчик webhook’ов IPN от NOWPayments ─────────────────────────────────
+async def fetch_subscription_invoices(subscription_id: str) -> list[dict]:
+    jwt = await _get_jwt()
+    headers = {
+        "Authorization": f"Bearer {jwt}",
+        "x-api-key":     API_KEY
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{BASE_URL}/subscriptions/{subscription_id}/invoices",
+            headers=headers,
+            timeout=10.0
+        )
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result", [])
+
+# ─── Обработчик webhook IPN ──────────────────────────────────────────────────
 async def handle_ipn(request: web.Request) -> web.Response:
-    """
-    Вебхук для обработки IPN-уведомлений от NOWPayments.
-    При статусе payment_status == "finished" активирует подписку в БД
-    и отправляет сообщение в Telegram.
-    """
-    raw_body = await request.read()
+    raw = await request.read()
     try:
         data = await request.json()
     except Exception:
-        logging.exception("Failed to parse JSON from IPN")
+        logging.exception("Failed to parse IPN JSON")
         return web.Response(status=400, text="Bad JSON")
 
-    sig_hdr = request.headers.get("x-nowpayments-signature", None)
-    logging.info("=== NOWPayments IPN received ===")
+    logging.info("=== IPN RECEIVED ===")
     logging.info("Headers: %s", dict(request.headers))
-    logging.info("Raw body: %s", raw_body)
-    logging.info("Parsed JSON: %s", data)
-    logging.info("Signature header: %s", sig_hdr)
+    logging.info("Body: %s", data)
 
-    # === Опциональная проверка подписи HMAC-SHA512 ===
-    # if not sig_hdr:
-    #     logging.warning("Missing signature header – rejecting")
-    #     return web.Response(status=400, text="No signature")
-    #
-    # expected = hmac.new(IPN_SECRET.encode(), raw_body, hashlib.sha512).hexdigest()
-    # if not hmac.compare_digest(expected, sig_hdr):
-    #     logging.warning("Bad IPN signature – rejecting")
+    # Опциональная проверка подписи:
+    # sig = request.headers.get("x-nowpayments-signature", "")
+    # expected = hmac.new(IPN_SECRET.encode(), raw, hashlib.sha512).hexdigest()
+    # if not hmac.compare_digest(sig, expected):
     #     return web.Response(status=400, text="Invalid signature")
-    # ================================================
 
-    # Активируем подписку при успешной оплате
-    if data.get("payment_status") == "finished":
-        try:
-            user_id = int(data.get("order_id", 0))
-            logging.info(f"Activating subscription for user_id={user_id}")
+    status = data.get("payment_status") or data.get("status")
+    if status in ("finished", "PAID"):
+        sub_id = data.get("subscription_id") or data.get("id")
+        if sub_id:
+            # Обновляем expire_at
+            conn = get_conn()
+            cur  = conn.cursor()
+            cur.execute("""
+                UPDATE subscriptions
+                   SET status     = 'ACTIVE',
+                       expire_at  = DATE_ADD(NOW(), INTERVAL 30 DAY),
+                       updated_at = NOW()
+                 WHERE subscription_id = %s
+            """, (sub_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
 
+            # Узнаём user_id и шлём сообщение
             conn = get_conn()
             cur  = conn.cursor()
             cur.execute(
-                """
-                UPDATE users
-                   SET is_subscribed = 1,
-                       subscription_until = DATE_ADD(NOW(), INTERVAL 30 DAY)
-                 WHERE user_id = %s
-                """,
-                (user_id,)
+                "SELECT user_id FROM subscriptions WHERE subscription_id=%s",
+                (sub_id,)
             )
-            conn.commit()
-            rows = cur.rowcount
+            row = cur.fetchone()
             cur.close()
             conn.close()
-            logging.info(f"Database updated, rows affected: {rows}")
+            if row:
+                user_id = row[0]
+                await bot.send_message(user_id, "✅ Ваша подписка успешно активирована!")
 
-            # Отправляем уведомление в Telegram
-            await bot.send_message(
-                user_id,
-                "🎉 Оплата прошла успешно! Ваша подписка активирована на 30 дней."
-            )
-            logging.info(f"Sent confirmation message to {user_id}")
-
-        except Exception:
-            logging.exception("Error while activating subscription")
-
-    # Возвращаем OK, чтобы NOWPayments не повторял попытки
     return web.Response(text="OK")
+
+# ─── Создание aiohttp-приложения для IPN ──────────────────────────────────────
+def create_app() -> web.Application:
+    app = web.Application()
+    app.router.add_post(IPN_ROUTE, handle_ipn)
+    logging.info("🟢 IPN app ready on %s", IPN_ROUTE)
+    return app
