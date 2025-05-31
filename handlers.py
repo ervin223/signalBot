@@ -15,7 +15,8 @@ from aiogram.types import (
 
 from db import get_conn, save_language
 from locale_utils import load_messages
-from payments import create_email_subscription, fetch_subscription_invoices
+from payments import create_email_subscription, fetch_subscription_invoices, SUBSCRIPTION_PLANS
+
 
 # ─── FSM ──────────────────────────────────────────────────────────────────────
 class Form(StatesGroup):
@@ -46,14 +47,15 @@ def main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
     )
 
 def buy_kb(lang: str) -> InlineKeyboardMarkup:
-    msgs = load_messages(lang)
-    btn_text = msgs.get(
-        "buy_button",
-        "💳 Buy subscription" if lang == "en" else "💳 Оплатить подписку"
-    )
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=btn_text, callback_data="action:buy")]
-    ])
+    from payments import SUBSCRIPTION_PLANS  # если нужно импортировать
+
+    buttons = []
+    for key, plan in SUBSCRIPTION_PLANS.items():
+        label = plan[f"label_{lang}"]
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"buy:{key}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 # ─── Утилита ────────────────────────────────────────────────────────────────────
 async def get_user_lang(user_id: int) -> str:
@@ -139,31 +141,38 @@ async def show_signals(msg: types.Message):
     lang = await get_user_lang(uid)
     msgs = load_messages(lang)
 
-    conn = get_conn()
-    cur  = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute("""
         SELECT status, expire_at
           FROM subscriptions
-         WHERE user_id=%s
+         WHERE user_id=%s AND status='ACTIVE' AND expire_at > NOW()
       ORDER BY created_at DESC
          LIMIT 1
     """, (uid,))
     row = cur.fetchone()
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
 
-    now = datetime.datetime.utcnow()
-    if not row or row[0] != "ACTIVE" or (row[1] and row[1] < now):
+    if not row:
         await msg.answer(text=msgs["pay_prompt"], reply_markup=buy_kb(lang))
     else:
         await msg.answer(text=msgs["signals_text"])
 
-async def on_buy(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    logging.info(f"🛒 on_buy вызван пользователем {uid}")
-    await cb.answer("Секунду, формирую счёт…")
 
-    # 1) проверяем email в БД
+async def on_buy(cb: types.CallbackQuery):
+    from payments import SUBSCRIPTION_PLANS
+
+    uid = cb.from_user.id
+    plan_key = cb.data.split(":", 1)[1]
+    await cb.answer("⏳ Формирую подписку…")
+
+    plan = SUBSCRIPTION_PLANS.get(plan_key)
+    if not plan:
+        await cb.message.answer("❌ Неверный план подписки.")
+        return
+
+    plan_id = plan["id"]
+
+    # Получаем email пользователя
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT email FROM users WHERE user_id=%s", (uid,))
     row = cur.fetchone()
@@ -174,15 +183,13 @@ async def on_buy(cb: types.CallbackQuery):
         return
 
     email = row[0]
-    plan_id = os.getenv("NOWPAYMENTS_PLAN_ID")
 
-    # 2) пытаемся создать подписку
+    # Создаём подписку
     try:
-        sub = await create_email_subscription(email)
+        sub = await create_email_subscription(email, plan_id)
     except httpx.HTTPStatusError as e:
         logging.error("NOWPayments /subscriptions error %s: %s", e.response.status_code, e.response.text)
-        # Если уже подписан, можно получить её через API (зависит от вашего бизнес-процесса)
-        await cb.message.answer("❌ Не удалось оформить подписку: " + e.response.json().get("message",""))
+        await cb.message.answer("❌ Не удалось оформить подписку: " + e.response.json().get("message", ""))
         return
 
     sub_id = sub.get("id")
@@ -192,25 +199,87 @@ async def on_buy(cb: types.CallbackQuery):
 
     logging.info(f"🔖 Subscription ID: {sub_id}")
 
-    # 3) сохраняем в БД статус WAITING_PAY
+    # Сохраняем в БД
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""
-        INSERT INTO subscriptions(subscription_id, user_id, plan_id, status, expire_at, created_at, updated_at)
-        VALUES (%s,%s,%s,'WAITING_PAY', DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), NOW())
+        INSERT INTO subscriptions(subscription_id, user_id, plan_id, email, status, expire_at, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, 'WAITING_PAY', DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), NOW())
         ON DUPLICATE KEY UPDATE
-            status     = 'WAITING_PAY',
-            expire_at  = DATE_ADD(NOW(), INTERVAL 30 DAY),
+            status = 'WAITING_PAY',
+            expire_at = DATE_ADD(NOW(), INTERVAL 30 DAY),
             updated_at = NOW()
-    """, (sub_id, uid, plan_id))
+    """, (sub_id, uid, plan_id, email))
     conn.commit(); cur.close(); conn.close()
 
-    # 4) получаем ссылку на оплату
+    # Получаем ссылку на оплату
     invs = await fetch_subscription_invoices(sub_id)
     if invs:
         url = invs[0].get("invoice_url")
         await cb.message.answer(f"🔗 Оплатите подписку по ссылке:\n{url}")
     else:
-        await cb.message.answer("✅ Подписка создана, но счёт")
+        await cb.message.answer("✅ Подписка создана, но счёт пока не готов. Попробуйте позже.")
+async def on_buy(cb: types.CallbackQuery):
+    from payments import SUBSCRIPTION_PLANS
+
+    uid = cb.from_user.id
+    plan_key = cb.data.split(":", 1)[1]
+    await cb.answer("⏳ Формирую подписку…")
+
+    plan = SUBSCRIPTION_PLANS.get(plan_key)
+    if not plan:
+        await cb.message.answer("❌ Неверный план подписки.")
+        return
+
+    plan_id = plan["id"]
+
+    # Получаем email пользователя
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT email FROM users WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+
+    if not row:
+        await cb.message.answer("❌ Email не найден. Сначала зарегистрируйтесь командой /start.")
+        return
+
+    email = row[0]
+
+    # Создаём подписку
+    try:
+        sub = await create_email_subscription(email, plan_id)
+    except httpx.HTTPStatusError as e:
+        logging.error("NOWPayments /subscriptions error %s: %s", e.response.status_code, e.response.text)
+        await cb.message.answer("❌ Не удалось оформить подписку: " + e.response.json().get("message", ""))
+        return
+
+    sub_id = sub.get("id")
+    if not sub_id:
+        await cb.message.answer("❌ Не удалось получить ID подписки.")
+        return
+
+    logging.info(f"🔖 Subscription ID: {sub_id}")
+
+    # Сохраняем в БД
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO subscriptions(subscription_id, user_id, plan_id, email, status, expire_at, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, 'WAITING_PAY', DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+            status = 'WAITING_PAY',
+            expire_at = DATE_ADD(NOW(), INTERVAL 30 DAY),
+            updated_at = NOW()
+    """, (sub_id, uid, plan_id, email))
+    conn.commit(); cur.close(); conn.close()
+
+    # Получаем ссылку на оплату
+    invs = await fetch_subscription_invoices(sub_id)
+    if invs:
+        url = invs[0].get("invoice_url")
+        await cb.message.answer(f"🔗 Оплатите подписку по ссылке:\n{url}")
+    else:
+        await cb.message.answer("✅ Подписка создана, но счёт пока не готов. Попробуйте позже.")
+
+
 
 
 
@@ -227,6 +296,6 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(on_reset,  lambda c: c.data == "action:reset")
     dp.message.register(show_signals,     F.text == load_messages("en")["signals_button"])
     dp.message.register(show_signals,     F.text == load_messages("ru")["signals_button"])
-    dp.callback_query.register(on_buy,    lambda c: c.data == "action:buy")
+    dp.callback_query.register(on_buy, lambda c: c.data.startswith("buy:"))
     dp.message.register(show_commands,    F.text == load_messages("en")["commands_button"])
     dp.message.register(show_commands,    F.text == load_messages("ru")["commands_button"])
