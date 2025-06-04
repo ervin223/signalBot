@@ -218,69 +218,6 @@ async def on_buy(cb: types.CallbackQuery):
         await cb.message.answer(f"🔗 Оплатите подписку по ссылке:\n{url}")
     else:
         await cb.message.answer("✅ Подписка создана, но счёт пока не готов. Попробуйте позже.")
-async def on_buy(cb: types.CallbackQuery):
-    from payments import SUBSCRIPTION_PLANS
-
-    uid = cb.from_user.id
-    plan_key = cb.data.split(":", 1)[1]
-    await cb.answer("⏳ Формирую подписку…")
-
-    plan = SUBSCRIPTION_PLANS.get(plan_key)
-    if not plan:
-        await cb.message.answer("❌ Неверный план подписки.")
-        return
-
-    plan_id = plan["id"]
-
-    # Получаем email пользователя
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT email FROM users WHERE user_id=%s", (uid,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
-
-    if not row:
-        await cb.message.answer("❌ Email не найден. Сначала зарегистрируйтесь командой /start.")
-        return
-
-    email = row[0]
-
-    # Создаём подписку
-    try:
-        sub = await create_email_subscription(email, plan_id)
-    except httpx.HTTPStatusError as e:
-        logging.error("NOWPayments /subscriptions error %s: %s", e.response.status_code, e.response.text)
-        await cb.message.answer("❌ Не удалось оформить подписку: " + e.response.json().get("message", ""))
-        return
-
-    sub_id = sub.get("id")
-    if not sub_id:
-        await cb.message.answer("❌ Не удалось получить ID подписки.")
-        return
-
-    logging.info(f"🔖 Subscription ID: {sub_id}")
-
-    # Сохраняем в БД
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO subscriptions(subscription_id, user_id, plan_id, email, status, expire_at, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, 'WAITING_PAY', DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), NOW())
-        ON DUPLICATE KEY UPDATE
-            status = 'WAITING_PAY',
-            expire_at = DATE_ADD(NOW(), INTERVAL 30 DAY),
-            updated_at = NOW()
-    """, (sub_id, uid, plan_id, email))
-    conn.commit(); cur.close(); conn.close()
-
-    # Получаем ссылку на оплату
-    invs = await fetch_subscription_invoices(sub_id)
-    if invs:
-        url = invs[0].get("invoice_url")
-        await cb.message.answer(f"🔗 Оплатите подписку по ссылке:\n{url}")
-    else:
-        await cb.message.answer("✅ Подписка создана, но счёт пока не готов. Попробуйте позже.")
-
-
-
 
 
 async def show_commands(msg: types.Message):
