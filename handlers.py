@@ -142,20 +142,37 @@ async def show_signals(msg: types.Message):
     msgs = load_messages(lang)
 
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""
-        SELECT status, expire_at
-          FROM subscriptions
-         WHERE user_id=%s AND status='ACTIVE' AND expire_at > NOW()
-      ORDER BY created_at DESC
-         LIMIT 1
-    """, (uid,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
+    try:
+        # Проверка активной подписки
+        cur.execute("""
+            SELECT status, expire_at
+              FROM subscriptions
+             WHERE user_id=%s AND status='ACTIVE' AND expire_at > NOW()
+          ORDER BY created_at DESC
+             LIMIT 1
+        """, (uid,))
+        row = cur.fetchone()
 
-    if not row:
-        await msg.answer(text=msgs["pay_prompt"], reply_markup=buy_kb(lang))
-    else:
-        await msg.answer(text=msgs["signals_text"])
+        if not row:
+            await msg.answer(text=msgs["pay_prompt"], reply_markup=buy_kb(lang))
+            return
+
+        # Если подписка активна — выводим сигналы
+        cur.execute("SELECT text FROM signals ORDER BY created_at DESC")
+        signals = cur.fetchall()
+
+        if not signals:
+            await msg.answer("📭 Сигналов пока нет.")
+            return
+
+        text = "\n\n".join(f"📌 {row[0]}" for row in signals)
+        await msg.answer(text=text)
+
+    except Exception as e:
+        logging.error(f"❌ Ошибка при выводе сигналов: {e}")
+        await msg.answer("⚠️ Произошла ошибка. Попробуйте позже.")
+    finally:
+        cur.close(); conn.close()
 
 
 async def on_buy(cb: types.CallbackQuery):
@@ -219,6 +236,87 @@ async def on_buy(cb: types.CallbackQuery):
     else:
         await cb.message.answer("✅ Подписка создана, но счёт пока не готов. Попробуйте позже.")
 
+async def admin_login(msg: types.Message):
+    password = msg.text.split(maxsplit=1)[1] if len(msg.text.split()) > 1 else ""
+    if password != os.getenv("ADMIN_PASSWORD"):
+        return await msg.answer("❌ Неверный пароль.")
+
+    uid = msg.from_user.id
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("REPLACE INTO admins(user_id, is_authorized) VALUES (%s, TRUE)", (uid,))
+    conn.commit(); cur.close(); conn.close()
+
+    await msg.answer("✅ Вы авторизованы как администратор.")
+
+async def add_signal(msg: types.Message):
+    uid = msg.from_user.id
+    text = msg.text.removeprefix("/add_signal").strip()
+
+    if not text:
+        return await msg.answer("❗ Укажите текст сигнала.")
+
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return await msg.answer("⛔ Нет доступа.")
+
+    cur.execute("INSERT INTO signals(text) VALUES (%s)", (text,))
+    conn.commit(); cur.close(); conn.close()
+
+    await msg.answer("✅ Сигнал добавлен.")
+
+async def clear_signals(msg: types.Message):
+    uid = msg.from_user.id
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return await msg.answer("⛔ Нет доступа.")
+
+    cur.execute("DELETE FROM signals")
+    conn.commit(); cur.close(); conn.close()
+    await msg.answer("🗑 Все сигналы удалены.")
+
+async def show_admin_signals(msg: types.Message):
+    uid = msg.from_user.id
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return await msg.answer("⛔ Нет доступа.")
+
+    cur.execute("SELECT text FROM signals ORDER BY created_at DESC")
+    signals = cur.fetchall(); cur.close(); conn.close()
+
+    if not signals:
+        return await msg.answer("📭 Сигналов нет.")
+    
+    text = "\n\n".join(f"📌 {row[0]}" for row in signals)
+    await msg.answer(text)
+
+
+async def logout_admin(msg: types.Message):
+    uid = msg.from_user.id
+
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+
+    if not row or not row[0]:
+        await msg.answer("ℹ️ Вы не авторизованы как администратор.")
+    else:
+        cur.execute("DELETE FROM admins WHERE user_id=%s", (uid,))
+        conn.commit()
+        lang = await get_user_lang(uid)
+        await msg.answer(
+            "🔒 Вы вышли из режима администратора.",
+            reply_markup=main_menu_kb(lang)
+        )
+
+    cur.close(); conn.close()
+
+
 
 async def show_commands(msg: types.Message):
     lang = await get_user_lang(msg.from_user.id)
@@ -236,3 +334,8 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(on_buy, lambda c: c.data.startswith("buy:"))
     dp.message.register(show_commands,    F.text == load_messages("en")["commands_button"])
     dp.message.register(show_commands,    F.text == load_messages("ru")["commands_button"])
+    dp.message.register(add_signal, Command("add_signal"))
+    dp.message.register(clear_signals, Command("clear_signals"))
+    dp.message.register(show_admin_signals, Command("show_signals_admin"))
+    dp.message.register(admin_login, Command("admin_login"))
+    dp.message.register(logout_admin, Command("logout_admin"))
