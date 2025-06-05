@@ -11,11 +11,12 @@ from handlers import register_handlers
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=__import__("os").getenv("TELEGRAM_TOKEN"))
 dp  = Dispatcher()
+register_handlers(dp, bot)
 
 async def start_bot():
-    register_handlers(dp)
     logging.info("🟢 Telegram polling started")
     await dp.start_polling(bot)
+
 
 async def start_ipn():
     app = create_app()

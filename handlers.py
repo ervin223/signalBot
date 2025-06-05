@@ -16,6 +16,10 @@ from aiogram.types import (
 from db import get_conn, save_language
 from locale_utils import load_messages
 from payments import create_email_subscription, fetch_subscription_invoices, SUBSCRIPTION_PLANS
+from aiogram import Bot
+
+
+bot = None
 
 
 # ─── FSM ──────────────────────────────────────────────────────────────────────
@@ -23,6 +27,8 @@ class Form(StatesGroup):
     lang     = State()
     username = State()
     email    = State()
+    support = State()
+
 
 # ─── Keyboards ─────────────────────────────────────────────────────────────────
 def language_kb() -> InlineKeyboardMarkup:
@@ -41,7 +47,8 @@ def main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[ 
             KeyboardButton(text=msgs["signals_button"]),
-            KeyboardButton(text=msgs["commands_button"])
+            KeyboardButton(text=msgs["commands_button"]),
+            KeyboardButton(text="📩 Техподдержка")
         ]],
         resize_keyboard=True
     )
@@ -316,6 +323,51 @@ async def logout_admin(msg: types.Message):
 
     cur.close(); conn.close()
 
+async def start_support(msg: types.Message, state: FSMContext):
+    await msg.answer("✍️ Напишите ваш вопрос, и администратор ответит вам.")
+    await state.set_state(Form.support)
+
+async def handle_support_question(msg: types.Message, state: FSMContext):
+    await state.clear()
+    admin_id = int(os.getenv("ADMIN_TELEGRAM_ID"))  # задайте в .env
+    await msg.answer("✅ Ваш вопрос отправлен. Администратор скоро ответит.")
+    await bot.send_message(
+        admin_id,
+        f"📨 Новый вопрос от @{msg.from_user.username or msg.from_user.id} (ID: {msg.from_user.id}):\n\n{msg.text}"
+    )
+
+async def reply_to_user(msg: types.Message):
+    uid = msg.from_user.id
+
+    # Проверка авторизации
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        await msg.answer("⛔ У вас нет доступа.")
+        cur.close(); conn.close()
+        return
+
+    # Проверка формата команды
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await msg.answer("⚠️ Используй формат:\n`/reply <user_id> <текст>`", parse_mode="Markdown")
+        return
+
+    target_id = parts[1]
+    text      = parts[2]
+
+    try:
+        await bot.send_message(int(target_id), f"📬 Ответ от администратора:\n\n{text}")
+        await msg.answer("✅ Ответ отправлен.")
+    except Exception as e:
+        logging.error(f"Ошибка отправки ответа: {e}")
+        await msg.answer("❌ Не удалось отправить сообщение.")
+    finally:
+        cur.close(); conn.close()
+
+
+
 
 
 async def show_commands(msg: types.Message):
@@ -323,7 +375,7 @@ async def show_commands(msg: types.Message):
     await msg.answer(text=load_messages(lang)["commands_list"])
 
 # ─── Регистрация хэндлеров ─────────────────────────────────────────────────────
-def register_handlers(dp: Dispatcher):
+def register_handlers(dp: Dispatcher, external_bot: Bot):
     dp.message.register(cmd_start,        Command("start"))
     dp.callback_query.register(on_lang,   Form.lang, lambda c: c.data.startswith("lang:"))
     dp.message.register(process_username, Form.username)
@@ -339,3 +391,9 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(show_admin_signals, Command("show_signals_admin"))
     dp.message.register(admin_login, Command("admin_login"))
     dp.message.register(logout_admin, Command("logout_admin"))
+    dp.message.register(start_support, F.text == "📩 Техподдержка")
+    dp.message.register(handle_support_question, Form.support)
+    dp.message.register(reply_to_user, Command("reply"))
+
+    global bot
+    bot = external_bot
