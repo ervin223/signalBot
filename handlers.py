@@ -17,6 +17,8 @@ from db import get_conn, save_language
 from locale_utils import load_messages
 from payments import create_email_subscription, fetch_subscription_invoices, SUBSCRIPTION_PLANS
 from aiogram import Bot
+from remind import remind_unpaid_users
+from keyboards import buy_kb
 
 
 bot = None
@@ -48,21 +50,12 @@ def main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
         keyboard=[[ 
             KeyboardButton(text=msgs["signals_button"]),
             KeyboardButton(text=msgs["commands_button"]),
-            KeyboardButton(text="📩 Техподдержка")
+            KeyboardButton(text="📩 Техподдержка"),
+            KeyboardButton(text="🕓 История сигналов"),
+            KeyboardButton(text="📰 Новости") 
         ]],
         resize_keyboard=True
     )
-
-def buy_kb(lang: str) -> InlineKeyboardMarkup:
-    from payments import SUBSCRIPTION_PLANS  # если нужно импортировать
-
-    buttons = []
-    for key, plan in SUBSCRIPTION_PLANS.items():
-        label = plan[f"label_{lang}"]
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"buy:{key}")])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 # ─── Утилита ────────────────────────────────────────────────────────────────────
 async def get_user_lang(user_id: int) -> str:
@@ -329,12 +322,20 @@ async def start_support(msg: types.Message, state: FSMContext):
 
 async def handle_support_question(msg: types.Message, state: FSMContext):
     await state.clear()
-    admin_id = int(os.getenv("ADMIN_TELEGRAM_ID"))  # задайте в .env
-    await msg.answer("✅ Ваш вопрос отправлен. Администратор скоро ответит.")
+    user_id = msg.from_user.id
+    lang = await get_user_lang(user_id)  # Получаем язык пользователя
+    admin_id = int(os.getenv("ADMIN_TELEGRAM_ID"))
+
+    await msg.answer(
+        "✅ Ваш вопрос отправлен. Администратор скоро ответит.",
+        reply_markup=main_menu_kb(lang)  # Восстанавливаем меню
+    )
+
     await bot.send_message(
         admin_id,
         f"📨 Новый вопрос от @{msg.from_user.username or msg.from_user.id} (ID: {msg.from_user.id}):\n\n{msg.text}"
     )
+
 
 async def reply_to_user(msg: types.Message):
     uid = msg.from_user.id
@@ -366,13 +367,66 @@ async def reply_to_user(msg: types.Message):
     finally:
         cur.close(); conn.close()
 
+async def show_history(msg: types.Message):
+    uid = msg.from_user.id
+    lang = await get_user_lang(uid)
+    msgs = load_messages(lang)
 
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT text FROM signal_history ORDER BY created_at DESC LIMIT 100")
+        signals = cur.fetchall()
+
+        if not signals:
+            await msg.answer("📭 История сигналов пуста.")
+            return
+
+        text = "\n\n".join(f"📌 {row[0]}" for row in signals)
+        await msg.answer(text=text)
+
+    except Exception as e:
+        logging.error(f"❌ Ошибка при выводе истории: {e}")
+        await msg.answer("⚠️ Произошла ошибка. Попробуйте позже.")
+    finally:
+        cur.close(); conn.close()
+
+async def show_news(msg: types.Message):
+    await msg.answer("👉 Для просмотра текущих новостей перейдите: https://t.me/your_channel_name")
+
+    from remind import remind_unpaid_users
+
+async def manual_remind(msg: types.Message):
+    uid = msg.from_user.id
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_authorized FROM admins WHERE user_id=%s", (uid,))
+    row = cur.fetchone(); cur.close(); conn.close()
+
+    if not row or not row[0]:
+        return await msg.answer("⛔ Нет доступа.")
+
+    await remind_unpaid_users(bot)
+    await msg.answer("📣 Напоминания отправлены.")
 
 
 
 async def show_commands(msg: types.Message):
     lang = await get_user_lang(msg.from_user.id)
     await msg.answer(text=load_messages(lang)["commands_list"])
+
+async def restore_menu_if_registered(msg: types.Message, state: FSMContext):
+    if await state.get_state() is not None:
+        return  # если пользователь в процессе ввода — не трогаем
+    user_id = msg.from_user.id
+
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT EXISTS(SELECT 1 FROM users WHERE user_id=%s)", (user_id,))
+    exists = cur.fetchone()[0]
+    cur.close(); conn.close()
+
+    if exists:
+        lang = await get_user_lang(user_id)
+        await msg.answer("🔄 Меню восстановлено", reply_markup=main_menu_kb(lang))
+
 
 # ─── Регистрация хэндлеров ─────────────────────────────────────────────────────
 def register_handlers(dp: Dispatcher, external_bot: Bot):
@@ -394,6 +448,13 @@ def register_handlers(dp: Dispatcher, external_bot: Bot):
     dp.message.register(start_support, F.text == "📩 Техподдержка")
     dp.message.register(handle_support_question, Form.support)
     dp.message.register(reply_to_user, Command("reply"))
+    dp.message.register(show_history, F.text == "🕓 История сигналов")
+    dp.message.register(show_news, F.text == "📰 Новости")
+    dp.message.register(manual_remind, Command("remind"))
+    dp.message.register(restore_menu_if_registered)
+
+
+
 
     global bot
     bot = external_bot
